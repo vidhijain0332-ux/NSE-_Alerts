@@ -2,16 +2,13 @@ import os
 import json
 import time
 import logging
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
-from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
-import httpx
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -25,9 +22,8 @@ IST = ZoneInfo("Asia/Kolkata")
 # ── Environment Variables ─────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 SHEET_ID             = os.environ["GOOGLE_SHEET_ID"]
-GOOGLE_CREDS_JSON    = os.environ["GOOGLE_CREDENTIALS_JSON"]   # full JSON string
+GOOGLE_CREDS_JSON    = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-# 6 channel IDs
 CHANNEL_RESULTS      = os.environ["TELEGRAM_CHANNEL_RESULTS"]
 CHANNEL_INVESTORS    = os.environ["TELEGRAM_CHANNEL_INVESTORS"]
 CHANNEL_ACQ          = os.environ["TELEGRAM_CHANNEL_ACQ"]
@@ -112,8 +108,29 @@ CATEGORIES = {
         ],
         "exclude_keywords": []
     }
-    # "Others" is the catch-all — no keywords needed
 }
+
+# ── First Disclosure keyword lists ───────────────────────────────────────────
+# Applied only to: Acquisition & Merger, Demerger, Change in Management
+FIRST_DISC_CATEGORIES = {"Acquisition & Merger", "Demerger", "Change in Management"}
+
+FIRST_DISC_POSITIVE = [
+    "intimation", "first disclosure", "initial disclosure",
+    "proposed", "intends to", "intention to", "considering",
+    "exploring", "letter of intent", "loi", "term sheet",
+    "mou", "memorandum of understanding", "in-principle",
+    "board has approved", "board approved", "board has decided",
+    "entered into", "signing", "signed", "execution of",
+    "agreement signed", "agreement entered"
+]
+
+FIRST_DISC_NEGATIVE = [
+    "outcome", "completion", "completed", "effective date",
+    "nclt", "tribunal", "court approval", "approved by",
+    "record date", "allotment", "post merger", "post acquisition",
+    "pursuant to", "further to", "follow-up", "followup",
+    "subsequent", "update on", "status of", "progress of"
+]
 
 # ── Seen IDs ──────────────────────────────────────────────────────────────────
 def load_seen_ids() -> set:
@@ -127,7 +144,7 @@ def save_seen_ids(seen: set):
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump({"seen_ids": list(seen)}, f)
 
-# ── NSE Fetch ─────────────────────────────────────────────────────────────────
+# ── NSE Session ───────────────────────────────────────────────────────────────
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -139,7 +156,6 @@ NSE_HEADERS = {
 def get_nse_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(NSE_HEADERS)
-    # Hit the main page first to get cookies
     try:
         session.get("https://www.nseindia.com", timeout=15)
         time.sleep(2)
@@ -152,42 +168,106 @@ def get_nse_session() -> requests.Session:
         log.warning(f"Session warm-up failed: {e}")
     return session
 
+# ── FIX 3: Multi-endpoint fetch for complete coverage ────────────────────────
 def fetch_nse_announcements(session: requests.Session) -> list:
-    """Fetch last 24h announcements from NSE."""
-    url = (
-        "https://www.nseindia.com/api/corporate-announcements"
-        "?index=equities&from_date=&to_date=&category=&symbol="
-    )
-    try:
-        resp = session.get(url, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, list) else data.get("data", [])
-    except Exception as e:
-        log.error(f"NSE fetch error: {e}")
-        return []
+    """
+    Hits multiple NSE endpoints and merges results.
+    This ensures we never miss announcements that appear on only one endpoint.
+    """
+    now_ist  = datetime.now(IST)
+    from_dt  = (now_ist - timedelta(days=2)).strftime("%d-%m-%Y")
+    to_dt    = now_ist.strftime("%d-%m-%Y")
 
+    endpoints = [
+        # No date filter — returns latest batch (fastest, most reliable)
+        "https://www.nseindia.com/api/corporate-announcements?index=equities",
+        # With explicit date range — catches anything the above misses
+        f"https://www.nseindia.com/api/corporate-announcements?index=equities&from_date={from_dt}&to_date={to_dt}",
+        # SME board
+        "https://www.nseindia.com/api/corporate-announcements?index=sme",
+    ]
+
+    all_items  = []
+    seen_keys  = set()
+
+    for url in endpoints:
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            data  = resp.json()
+            items = data if isinstance(data, list) else data.get("data", [])
+            log.info(f"Endpoint returned {len(items)} items: {url[:80]}")
+            for item in items:
+                an_id  = str(item.get("an_id", item.get("seqNo", "")))
+                symbol = str(item.get("symbol", ""))
+                key    = f"{symbol}_{an_id}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_items.append(item)
+            time.sleep(1)
+        except Exception as e:
+            log.warning(f"Endpoint failed ({url[:70]}): {e}")
+
+    log.info(f"Total unique announcements after merge: {len(all_items)}")
+    return all_items
+
+# ── FIX 1: Robust company name extraction ────────────────────────────────────
+def extract_company_name(ann: dict) -> str:
+    """
+    NSE API returns company name under different field names across endpoints.
+    Try all known variants in order of reliability.
+    """
+    for field in ("corp_name", "companyName", "company_name",
+                  "sm_name", "company", "issuerName", "name"):
+        val = ann.get(field, "")
+        if val and str(val).strip():
+            return str(val).strip()
+    return ann.get("symbol", "Unknown")
+
+# ── FIX 2: First Disclosure Yes/No logic ─────────────────────────────────────
+def is_first_disclosure(subject: str, desc: str, category: str) -> str:
+    """
+    Returns:
+      'Yes'  — looks like first intimation
+      'No'   — looks like follow-up / outcome / completion
+      ''     — not applicable for this category (Results, Investors Meet, Others)
+    """
+    if category not in FIRST_DISC_CATEGORIES:
+        return ""
+
+    text = (subject + " " + desc).lower()
+
+    # Negative signals take priority — follow-ups/outcomes say No
+    if any(kw in text for kw in FIRST_DISC_NEGATIVE):
+        return "No"
+
+    if any(kw in text for kw in FIRST_DISC_POSITIVE):
+        return "Yes"
+
+    # No clear signal — default to Yes for these categories
+    # (first mentions are far more common than follow-ups in NSE filings)
+    return "Yes"
+
+# ── Screener link ─────────────────────────────────────────────────────────────
 def screener_link(symbol: str) -> str:
     return f"https://www.screener.in/company/{symbol}/announcements/"
-
-def nse_link(symbol: str, an_id: str) -> str:
-    return f"https://www.nseindia.com/companies-listing/corporate-filings-announcements"
 
 # ── Categorise ────────────────────────────────────────────────────────────────
 def categorise(subject: str, desc: str) -> str:
     text = (subject + " " + desc).lower()
 
-    # Check exclusions for Acq & Merger first
-    acq_excluded = any(kw in text for kw in CATEGORIES["Acquisition & Merger"]["exclude_keywords"])
+    acq_excluded = any(
+        kw in text for kw in CATEGORIES["Acquisition & Merger"]["exclude_keywords"]
+    )
 
     for cat, cfg in CATEGORIES.items():
         if any(kw in text for kw in cfg["keywords"]):
             if cat == "Acquisition & Merger" and acq_excluded:
                 continue
-            # Demerger before Acquisition (more specific)
+            # Demerger is more specific than Acquisition — check it first
             if cat == "Acquisition & Merger":
                 if any(kw in text for kw in CATEGORIES["Demerger"]["keywords"]):
-                    continue  # will be caught by Demerger
+                    continue
             return cat
 
     return "Others"
@@ -199,10 +279,7 @@ def extract_investor_name(subject: str, desc: str) -> str:
         "Goldman Sachs", "JP Morgan", "Morgan Stanley",
         "Bandhan Small Cap", "HDFC Mutual Fund", "Motilal Oswal"
     ]
-    found = []
-    for b in brokerages:
-        if b.lower() in text:
-            found.append(b)
+    found = [b for b in brokerages if b.lower() in text]
     return ", ".join(found) if found else ""
 
 # ── Google Sheets ─────────────────────────────────────────────────────────────
@@ -218,14 +295,14 @@ def get_sheets_client():
 def append_to_sheet(client, tab_name: str, row: list):
     try:
         sheet = client.open_by_key(SHEET_ID)
-        ws = sheet.worksheet(tab_name)
+        ws    = sheet.worksheet(tab_name)
         ws.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
         log.error(f"Sheet append error ({tab_name}): {e}")
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_telegram(channel_id: str, text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": channel_id,
         "text": text,
@@ -239,13 +316,13 @@ def send_telegram(channel_id: str, text: str):
     except Exception as e:
         log.error(f"Telegram send error: {e}")
 
-def format_telegram_message(ann: dict, category: str) -> str:
-    symbol   = ann.get("symbol", "")
-    company  = ann.get("corp_name", ann.get("company_name", ""))
-    subject  = ann.get("subject", ann.get("desc", ""))
-    an_date  = ann.get("sort_date", ann.get("an_dt", ""))
-    nse_url  = ann.get("attchmntFile", "")
-    sc_link  = screener_link(symbol)
+def format_telegram_message(ann: dict, category: str,
+                             company: str, first_disc_flag: str) -> str:
+    symbol  = ann.get("symbol", "")
+    subject = ann.get("subject", ann.get("desc", ""))
+    an_date = ann.get("sort_date", ann.get("an_dt", ""))
+    nse_url = ann.get("attchmntFile", "")
+    sc_link = screener_link(symbol)
 
     lines = [
         f"<b>📢 {category}</b>",
@@ -253,12 +330,16 @@ def format_telegram_message(ann: dict, category: str) -> str:
         f"<b>Subject:</b> {subject}",
         f"<b>Date:</b> {an_date}",
     ]
+    # Only show First Disclosure line for relevant categories
+    if first_disc_flag:
+        lines.append(f"<b>First Disclosure:</b> {first_disc_flag}")
+
     if nse_url:
         lines.append(f"<b>NSE:</b> <a href='{nse_url}'>Download</a>")
     lines.append(f"<b>Screener:</b> <a href='{sc_link}'>View</a>")
     return "\n".join(lines)
 
-# ── Parse date from NSE ───────────────────────────────────────────────────────
+# ── Parse date ────────────────────────────────────────────────────────────────
 def parse_nse_date(ann: dict) -> datetime | None:
     for field in ("sort_date", "an_dt", "bm_dt", "exchdisstime"):
         raw = ann.get(field, "")
@@ -278,73 +359,72 @@ def run():
     log.info("=== NSE Bot run started ===")
     seen_ids = load_seen_ids()
 
-    session      = get_nse_session()
+    session       = get_nse_session()
     announcements = fetch_nse_announcements(session)
-    log.info(f"Fetched {len(announcements)} announcements from NSE")
 
     sheets_client = get_sheets_client()
 
-    now_ist   = datetime.now(IST)
-    cutoff    = now_ist - timedelta(hours=24)
+    now_ist = datetime.now(IST)
+    cutoff  = now_ist - timedelta(hours=24)
 
     new_count = 0
 
     for ann in announcements:
-        # ── Unique ID ──
-        an_id = str(ann.get("an_id", ann.get("seqNo", ann.get("sort_date", ""))))
-        symbol = ann.get("symbol", "")
+        # ── Unique key ────────────────────────────────────────────────────
+        an_id      = str(ann.get("an_id", ann.get("seqNo", ann.get("sort_date", ""))))
+        symbol     = ann.get("symbol", "")
         unique_key = f"{symbol}_{an_id}"
 
         if unique_key in seen_ids:
             continue
 
-        # ── Date filter ──
+        # ── Date filter ───────────────────────────────────────────────────
         dt = parse_nse_date(ann)
         if dt and dt < cutoff:
             seen_ids.add(unique_key)
             continue
 
-        # ── Extract fields ──
-        company  = ann.get("corp_name", ann.get("company_name", ""))
-        subject  = ann.get("subject", ann.get("desc", ""))
-        desc     = ann.get("attchmntText", ann.get("body", ""))
-        nse_date = ann.get("sort_date", ann.get("an_dt", ""))
-        first_disc = ann.get("exchdisstime", "")
+        # ── Extract fields ────────────────────────────────────────────────
+        company      = extract_company_name(ann)                         # FIX 1
+        subject      = ann.get("subject", ann.get("desc", ""))
+        desc         = ann.get("attchmntText", ann.get("body", ""))
+        nse_date     = ann.get("sort_date", ann.get("an_dt", ""))
         nse_file_url = ann.get("attchmntFile", "")
-        sc_url   = screener_link(symbol)
+        sc_url       = screener_link(symbol)
 
-        category = categorise(subject, desc)
-        cfg      = CATEGORIES.get(category, {"sheet_tab": "Others", "channel": CHANNEL_OTHERS})
+        category        = categorise(subject, desc)
+        first_disc_flag = is_first_disclosure(subject, desc, category)   # FIX 2
 
-        # ── Build sheet row ──
+        cfg     = CATEGORIES.get(category, {"sheet_tab": "Others", "channel": CHANNEL_OTHERS})
+        tab     = cfg["sheet_tab"] if isinstance(cfg, dict) else "Others"
+        channel = cfg["channel"]   if isinstance(cfg, dict) else CHANNEL_OTHERS
+
         logged_at = now_ist.strftime("%d-%m-%Y %H:%M")
 
+        # ── Build row ─────────────────────────────────────────────────────
         if category == "Investors Meet":
             investor_name = extract_investor_name(subject, desc)
             row = [
                 logged_at, company, symbol, category, subject,
                 desc[:500] if desc else subject,
-                investor_name, nse_date, first_disc, nse_file_url, sc_url
+                investor_name, nse_date, first_disc_flag, nse_file_url, sc_url
             ]
         else:
             row = [
                 logged_at, company, symbol, category, subject,
                 desc[:500] if desc else subject,
-                nse_date, first_disc, nse_file_url, sc_url
+                nse_date, first_disc_flag, nse_file_url, sc_url
             ]
-
-        tab = cfg["sheet_tab"] if isinstance(cfg, dict) else "Others"
-        channel = cfg["channel"] if isinstance(cfg, dict) else CHANNEL_OTHERS
 
         append_to_sheet(sheets_client, tab, row)
 
-        # ── Telegram message ──
-        msg = format_telegram_message(ann, category)
+        msg = format_telegram_message(ann, category, company, first_disc_flag)
         send_telegram(channel, msg)
 
         seen_ids.add(unique_key)
         new_count += 1
-        time.sleep(0.5)  # polite rate-limit
+        log.info(f"[{category}] {company} ({symbol}) — {subject[:70]}")
+        time.sleep(0.4)
 
     save_seen_ids(seen_ids)
     log.info(f"=== Run complete. {new_count} new announcements processed ===")
