@@ -1,0 +1,60 @@
+name: NSE Announcements Bot
+
+on:
+  schedule:
+    # Runs every 30 minutes, 24x7
+    - cron: "0,30 * * * *"
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore seen_ids cache (persists across runs) ──────────────────
+      - name: Restore seen_ids cache
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-${{ github.run_id }}
+          restore-keys: |
+            seen-ids-
+
+      # ── 5. Run the bot ────────────────────────────────────────────────────
+      - name: Run NSE Announcements Bot
+        env:
+          TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GOOGLE_SHEET_ID:             ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON:     ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          TELEGRAM_CHANNEL_RESULTS:    ${{ secrets.TELEGRAM_CHANNEL_RESULTS }}
+          TELEGRAM_CHANNEL_INVESTORS:  ${{ secrets.TELEGRAM_CHANNEL_INVESTORS }}
+          TELEGRAM_CHANNEL_ACQ:        ${{ secrets.TELEGRAM_CHANNEL_ACQ }}
+          TELEGRAM_CHANNEL_DEMERGER:   ${{ secrets.TELEGRAM_CHANNEL_DEMERGER }}
+          TELEGRAM_CHANNEL_MANAGEMENT: ${{ secrets.TELEGRAM_CHANNEL_MANAGEMENT }}
+          TELEGRAM_CHANNEL_OTHERS:     ${{ secrets.TELEGRAM_CHANNEL_OTHERS }}
+        run: python nse_announcements.py
+
+      # ── 6. Save updated seen_ids ──────────────────────────────────────────
+      - name: Commit updated seen_ids.json
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update seen_ids [skip ci]"
+          file_pattern: seen_ids.json
+          commit_user_name: "NSE Bot"
+          commit_user_email: "nse-bot@users.noreply.github.com"
