@@ -30,14 +30,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore seen_ids cache
-        uses: actions/cache@v4
-        with:
-          path: seen_ids.json
-          key: seen-ids-${{ github.run_id }}
-          restore-keys: |
-            seen-ids-
-
       - name: Run NSE Announcements Bot
         env:
           TELEGRAM_BOT_TOKEN:          ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -55,7 +47,8 @@ jobs:
         run: |
           git config user.name "NSE Bot"
           git config user.email "nse-bot@users.noreply.github.com"
-          git pull --rebase origin main
           git add seen_ids.json
-          git diff --staged --quiet || git commit -m "chore: update seen_ids [skip ci]"
+          git diff --staged --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update seen_ids [skip ci]"
+          git pull --rebase origin main
           git push origin main
