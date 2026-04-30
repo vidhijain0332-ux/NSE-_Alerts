@@ -2,7 +2,7 @@ name: NSE Announcements Bot
 
 on:
   schedule:
-    - cron: "0,30 * * * *"
+    - cron: "0 */2 * * *"   # every 2 hours
   workflow_dispatch:
 
 permissions:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25      # increased — gives room for large batches + TG threads
 
     steps:
       - name: Checkout repository
