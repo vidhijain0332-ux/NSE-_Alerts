@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import hashlib
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
@@ -29,6 +30,7 @@ CHANNEL_OTHERS     = os.environ["TELEGRAM_CHANNEL_OTHERS"]
 
 SEEN_IDS_FILE = "seen_ids.json"
 
+# ── Categories ────────────────────────────────────────────────────────────────
 CATEGORIES = {
     "Results": {
         "sheet_tab": "Results",
@@ -123,7 +125,7 @@ FIRST_DISC_NEGATIVE = [
     "follow-up", "subsequent", "update on", "status of", "progress of"
 ]
 
-# ── seen_ids — handles every possible file format ─────────────────────────────
+# ── Seen IDs ──────────────────────────────────────────────────────────────────
 def load_seen_ids() -> set:
     if os.path.exists(SEEN_IDS_FILE):
         try:
@@ -171,7 +173,6 @@ def screener_link(symbol: str) -> str:
 
 def categorise(subject: str, desc: str) -> str:
     text = (subject + " " + desc).lower()
-    # Demerger checked first — more specific than Acquisition
     for cat in ["Demerger", "Results", "Investors Meet",
                 "Change in Management", "Acquisition & Merger"]:
         cfg = CATEGORIES[cat]
@@ -200,7 +201,40 @@ def extract_investor_name(subject: str, desc: str) -> str:
     ]
     return ", ".join(b for b in brokerages if b.lower() in text)
 
-# ── NSE ───────────────────────────────────────────────────────────────────────
+# ── Telegram — fire-and-forget in a thread, never blocks main loop ────────────
+def _send_telegram_now(channel_id: str, text: str):
+    """Runs in its own thread. Retries up to 4x with short waits."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for attempt in range(4):
+        try:
+            r = requests.post(
+                url,
+                json={"chat_id": channel_id, "text": text,
+                      "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=15          # short timeout — never hangs long
+            )
+            if r.ok:
+                return
+            if r.status_code == 429:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 30)
+                log.warning(f"Telegram 429 — sleeping {retry_after}s")
+                time.sleep(retry_after + 2)
+            else:
+                log.error(f"Telegram {r.status_code}: {r.text[:120]}")
+                return
+        except Exception as e:
+            wait = 8 * (attempt + 1)
+            log.error(f"Telegram exception (attempt {attempt+1}/4): {e} — retry in {wait}s")
+            time.sleep(wait)
+    log.error(f"Telegram gave up after 4 retries for channel {channel_id}")
+
+def send_telegram(channel_id: str, text: str):
+    """Spawns a daemon thread — sheet writes are NEVER blocked by Telegram."""
+    t = threading.Thread(target=_send_telegram_now, args=(channel_id, text), daemon=True)
+    t.start()
+    return t   # caller can join() if needed
+
+# ── NSE fetch ─────────────────────────────────────────────────────────────────
 def get_nse_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
@@ -265,7 +299,7 @@ def fetch_nse_announcements(session: requests.Session) -> list:
     log.info(f"Total unique from NSE: {len(all_items)}")
     return all_items
 
-# ── Google Sheets — open ONCE, cache all tabs, retry on 429 ──────────────────
+# ── Google Sheets ─────────────────────────────────────────────────────────────
 def get_sheet_cache() -> dict:
     creds = Credentials.from_service_account_info(
         json.loads(GOOGLE_CREDS_JSON),
@@ -274,21 +308,21 @@ def get_sheet_cache() -> dict:
             "https://www.googleapis.com/auth/drive"
         ]
     )
-    gc     = gspread.authorize(creds)
-    ss     = gc.open_by_key(SHEET_ID)
-    cache  = {ws.title: ws for ws in ss.worksheets()}
+    gc    = gspread.authorize(creds)
+    ss    = gc.open_by_key(SHEET_ID)
+    cache = {ws.title: ws for ws in ss.worksheets()}
     log.info(f"Sheet tabs loaded: {list(cache.keys())}")
     return cache
 
 def append_to_sheet(cache: dict, tab: str, row: list):
     ws = cache.get(tab)
     if not ws:
-        log.error(f"Tab '{tab}' not found — check sheet tab names exactly")
-        return
+        log.error(f"Tab '{tab}' not found in sheet")
+        return False
     for attempt in range(4):
         try:
             ws.append_row(row, value_input_option="USER_ENTERED")
-            return
+            return True
         except gspread.exceptions.APIError as e:
             if "429" in str(e):
                 wait = 60 * (attempt + 1)
@@ -296,34 +330,11 @@ def append_to_sheet(cache: dict, tab: str, row: list):
                 time.sleep(wait)
             else:
                 log.error(f"Sheet append error ({tab}): {e}")
-                return
+                return False
     log.error(f"Sheet append gave up after 4 retries — {tab}")
+    return False
 
-# ── Telegram — retry with correct retry_after from API response ───────────────
-def send_telegram(channel_id: str, text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    for attempt in range(4):
-        try:
-            r = requests.post(
-                url,
-                json={"chat_id": channel_id, "text": text,
-                      "parse_mode": "HTML", "disable_web_page_preview": True},
-                timeout=25
-            )
-            if r.ok:
-                return
-            if r.status_code == 429:
-                retry_after = r.json().get("parameters", {}).get("retry_after", 35)
-                log.warning(f"Telegram 429 — sleeping {retry_after}s (attempt {attempt+1}/4)")
-                time.sleep(retry_after + 2)
-            else:
-                log.error(f"Telegram {r.status_code}: {r.text[:120]}")
-                return
-        except Exception as e:
-            log.error(f"Telegram exception: {e}")
-            return
-    log.error("Telegram gave up after 4 retries")
-
+# ── Message formatter ─────────────────────────────────────────────────────────
 def format_message(ann: dict, category: str, company: str, first_disc: str) -> str:
     symbol  = ann.get("symbol", "")
     subject = ann.get("subject", ann.get("desc", ""))
@@ -353,13 +364,24 @@ def run():
     cutoff  = now_ist - timedelta(hours=24)
     log.info(f"Cutoff: {cutoff.strftime('%d-%b-%Y %H:%M')} IST")
 
-    session       = get_nse_session()
-    announcements = fetch_nse_announcements(session)
+    # ── 1. Fetch announcements ─────────────────────────────────────────────────
+    try:
+        session       = get_nse_session()
+        announcements = fetch_nse_announcements(session)
+    except Exception as e:
+        log.error(f"NSE fetch failed: {e}")
+        return
 
-    # Open Google Sheet ONCE — avoids all 429 quota errors
-    sheet_cache = get_sheet_cache()
+    # ── 2. Open Google Sheet ONCE ──────────────────────────────────────────────
+    sheet_cache = {}
+    try:
+        sheet_cache = get_sheet_cache()
+    except Exception as e:
+        log.error(f"Google Sheets open failed: {e} — will still track seen_ids")
 
-    new_count = skip_count = 0
+    new_count  = 0
+    skip_count = 0
+    tg_threads = []   # collect so we can join before exit
 
     for ann in announcements:
         symbol   = ann.get("symbol", "")
@@ -370,11 +392,12 @@ def run():
         pk = f"{symbol}_{an_id}"
         ck = make_content_hash(symbol, subject, nse_date)
 
+        # ── Already processed ──────────────────────────────────────────────────
         if pk in seen_ids or ck in seen_ids:
             skip_count += 1
             continue
 
-        # Skip if older than 24h
+        # ── Too old ────────────────────────────────────────────────────────────
         dt = parse_nse_date(ann)
         if dt and dt < cutoff:
             seen_ids.update([pk, ck])
@@ -403,19 +426,38 @@ def run():
                    desc[:500] if desc else subject,
                    nse_date, first_disc, nse_file, sc_url]
 
-        # Write to sheet first
-        append_to_sheet(sheet_cache, tab, row)
-
-        # Then Telegram — 1.2s between sends stays within rate limits
-        time.sleep(1.2)
-        send_telegram(channel, format_message(ann, category, company, first_disc))
-
+        # ── STEP 1: Write to sheet (guaranteed, blocking, retried) ─────────────
+        sheet_written = False
+        if sheet_cache:
+            sheet_written = append_to_sheet(sheet_cache, tab, row)
+        
+        # ── STEP 2: Mark seen IMMEDIATELY after sheet write ────────────────────
+        #    This is the critical guarantee — seen_ids updated before Telegram
+        #    so even if the process dies mid-Telegram, no duplicate sheet rows
         seen_ids.update([pk, ck])
+
+        # ── STEP 3: Save seen_ids to disk after every entry ────────────────────
+        #    Protects against mid-run crashes
+        save_seen_ids(seen_ids)
+
+        # ── STEP 4: Telegram — fire-and-forget, never blocks sheet ────────────
+        t = send_telegram(channel, format_message(ann, category, company, first_disc))
+        tg_threads.append(t)
+
         new_count += 1
         log.info(f"[{category}] {company} ({symbol}) — {subject[:60]}")
 
+    # ── Wait up to 30s for all Telegram threads to finish before GH kills us ──
+    log.info(f"Waiting for {len(tg_threads)} Telegram threads to finish...")
+    deadline = time.time() + 30
+    for t in tg_threads:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+
     save_seen_ids(seen_ids)
-    log.info(f"=== Done. New: {new_count} | Skipped (already seen): {skip_count} ===")
+    log.info(f"=== Done. New: {new_count} | Skipped: {skip_count} ===")
 
 if __name__ == "__main__":
     run()
