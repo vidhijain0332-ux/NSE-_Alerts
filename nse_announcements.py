@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import hashlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
@@ -16,7 +17,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Timezone ──────────────────────────────────────────────────────────────────
 IST = ZoneInfo("Asia/Kolkata")
 
 # ── Environment Variables ─────────────────────────────────────────────────────
@@ -110,8 +110,6 @@ CATEGORIES = {
     }
 }
 
-# ── First Disclosure keyword lists ───────────────────────────────────────────
-# Applied only to: Acquisition & Merger, Demerger, Change in Management
 FIRST_DISC_CATEGORIES = {"Acquisition & Merger", "Demerger", "Change in Management"}
 
 FIRST_DISC_POSITIVE = [
@@ -132,17 +130,28 @@ FIRST_DISC_NEGATIVE = [
     "subsequent", "update on", "status of", "progress of"
 ]
 
-# ── Seen IDs ──────────────────────────────────────────────────────────────────
+# ── Seen IDs — dual key system ────────────────────────────────────────────────
 def load_seen_ids() -> set:
     if os.path.exists(SEEN_IDS_FILE):
-        with open(SEEN_IDS_FILE, "r") as f:
-            data = json.load(f)
-            return set(data.get("seen_ids", []))
+        try:
+            with open(SEEN_IDS_FILE, "r") as f:
+                data = json.load(f)
+                return set(data.get("seen_ids", []))
+        except Exception as e:
+            log.warning(f"Could not load seen_ids.json: {e} — starting fresh")
     return set()
 
 def save_seen_ids(seen: set):
     with open(SEEN_IDS_FILE, "w") as f:
-        json.dump({"seen_ids": list(seen)}, f)
+        json.dump({"seen_ids": list(seen)}, f, indent=2)
+
+def make_content_hash(symbol: str, subject: str, date_str: str) -> str:
+    """
+    Secondary dedup key based on content.
+    Catches cases where an_id differs across endpoints for the same announcement.
+    """
+    raw = f"{symbol.lower()}|{subject.lower().strip()}|{date_str}"
+    return "h_" + hashlib.md5(raw.encode()).hexdigest()[:16]
 
 # ── NSE Session ───────────────────────────────────────────────────────────────
 NSE_HEADERS = {
@@ -168,31 +177,23 @@ def get_nse_session() -> requests.Session:
         log.warning(f"Session warm-up failed: {e}")
     return session
 
-# ── FIX 3: Multi-endpoint fetch for complete coverage ────────────────────────
 def fetch_nse_announcements(session: requests.Session) -> list:
-    """
-    Hits multiple NSE endpoints and merges results.
-    This ensures we never miss announcements that appear on only one endpoint.
-    """
-    now_ist  = datetime.now(IST)
-    from_dt  = (now_ist - timedelta(days=2)).strftime("%d-%m-%Y")
-    to_dt    = now_ist.strftime("%d-%m-%Y")
+    now_ist = datetime.now(IST)
+    from_dt = (now_ist - timedelta(days=2)).strftime("%d-%m-%Y")
+    to_dt   = now_ist.strftime("%d-%m-%Y")
 
     endpoints = [
-        # No date filter — returns latest batch (fastest, most reliable)
         "https://www.nseindia.com/api/corporate-announcements?index=equities",
-        # With explicit date range — catches anything the above misses
         f"https://www.nseindia.com/api/corporate-announcements?index=equities&from_date={from_dt}&to_date={to_dt}",
-        # SME board
         "https://www.nseindia.com/api/corporate-announcements?index=sme",
     ]
 
-    all_items  = []
-    seen_keys  = set()
+    all_items = []
+    seen_keys = set()
 
     for url in endpoints:
         try:
-            resp = session.get(url, timeout=20)
+            resp = session.get(url, timeout=25)
             resp.raise_for_status()
             data  = resp.json()
             items = data if isinstance(data, list) else data.get("data", [])
@@ -204,19 +205,15 @@ def fetch_nse_announcements(session: requests.Session) -> list:
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_items.append(item)
-            time.sleep(1)
+            time.sleep(1.5)
         except Exception as e:
             log.warning(f"Endpoint failed ({url[:70]}): {e}")
 
     log.info(f"Total unique announcements after merge: {len(all_items)}")
     return all_items
 
-# ── FIX 1: Robust company name extraction ────────────────────────────────────
+# ── Field extractors ──────────────────────────────────────────────────────────
 def extract_company_name(ann: dict) -> str:
-    """
-    NSE API returns company name under different field names across endpoints.
-    Try all known variants in order of reliability.
-    """
     for field in ("corp_name", "companyName", "company_name",
                   "sm_name", "company", "issuerName", "name"):
         val = ann.get(field, "")
@@ -224,52 +221,32 @@ def extract_company_name(ann: dict) -> str:
             return str(val).strip()
     return ann.get("symbol", "Unknown")
 
-# ── FIX 2: First Disclosure Yes/No logic ─────────────────────────────────────
 def is_first_disclosure(subject: str, desc: str, category: str) -> str:
-    """
-    Returns:
-      'Yes'  — looks like first intimation
-      'No'   — looks like follow-up / outcome / completion
-      ''     — not applicable for this category (Results, Investors Meet, Others)
-    """
     if category not in FIRST_DISC_CATEGORIES:
         return ""
-
     text = (subject + " " + desc).lower()
-
-    # Negative signals take priority — follow-ups/outcomes say No
     if any(kw in text for kw in FIRST_DISC_NEGATIVE):
         return "No"
-
     if any(kw in text for kw in FIRST_DISC_POSITIVE):
         return "Yes"
-
-    # No clear signal — default to Yes for these categories
-    # (first mentions are far more common than follow-ups in NSE filings)
     return "Yes"
 
-# ── Screener link ─────────────────────────────────────────────────────────────
 def screener_link(symbol: str) -> str:
     return f"https://www.screener.in/company/{symbol}/announcements/"
 
-# ── Categorise ────────────────────────────────────────────────────────────────
 def categorise(subject: str, desc: str) -> str:
     text = (subject + " " + desc).lower()
-
     acq_excluded = any(
         kw in text for kw in CATEGORIES["Acquisition & Merger"]["exclude_keywords"]
     )
-
     for cat, cfg in CATEGORIES.items():
         if any(kw in text for kw in cfg["keywords"]):
             if cat == "Acquisition & Merger" and acq_excluded:
                 continue
-            # Demerger is more specific than Acquisition — check it first
             if cat == "Acquisition & Merger":
                 if any(kw in text for kw in CATEGORIES["Demerger"]["keywords"]):
                     continue
             return cat
-
     return "Others"
 
 def extract_investor_name(subject: str, desc: str) -> str:
@@ -330,10 +307,8 @@ def format_telegram_message(ann: dict, category: str,
         f"<b>Subject:</b> {subject}",
         f"<b>Date:</b> {an_date}",
     ]
-    # Only show First Disclosure line for relevant categories
     if first_disc_flag:
         lines.append(f"<b>First Disclosure:</b> {first_disc_flag}")
-
     if nse_url:
         lines.append(f"<b>NSE:</b> <a href='{nse_url}'>Download</a>")
     lines.append(f"<b>Screener:</b> <a href='{sc_link}'>View</a>")
@@ -358,6 +333,7 @@ def parse_nse_date(ann: dict) -> datetime | None:
 def run():
     log.info("=== NSE Bot run started ===")
     seen_ids = load_seen_ids()
+    log.info(f"Loaded {len(seen_ids)} seen IDs from file")
 
     session       = get_nse_session()
     announcements = fetch_nse_announcements(session)
@@ -367,33 +343,40 @@ def run():
     now_ist = datetime.now(IST)
     cutoff  = now_ist - timedelta(hours=24)
 
-    new_count = 0
+    new_count  = 0
+    skip_count = 0
 
     for ann in announcements:
-        # ── Unique key ────────────────────────────────────────────────────
-        an_id      = str(ann.get("an_id", ann.get("seqNo", ann.get("sort_date", ""))))
-        symbol     = ann.get("symbol", "")
-        unique_key = f"{symbol}_{an_id}"
+        symbol  = ann.get("symbol", "")
+        an_id   = str(ann.get("an_id", ann.get("seqNo", ann.get("sort_date", ""))))
+        subject = ann.get("subject", ann.get("desc", ""))
+        nse_date = ann.get("sort_date", ann.get("an_dt", ""))
 
-        if unique_key in seen_ids:
+        # ── Primary key: symbol + an_id ───────────────────────────────────
+        primary_key = f"{symbol}_{an_id}"
+
+        # ── Secondary key: content hash (catches same ann with diff an_id) ─
+        content_key = make_content_hash(symbol, subject, nse_date)
+
+        if primary_key in seen_ids or content_key in seen_ids:
+            skip_count += 1
             continue
 
         # ── Date filter ───────────────────────────────────────────────────
         dt = parse_nse_date(ann)
         if dt and dt < cutoff:
-            seen_ids.add(unique_key)
+            seen_ids.add(primary_key)
+            seen_ids.add(content_key)
             continue
 
         # ── Extract fields ────────────────────────────────────────────────
-        company      = extract_company_name(ann)                         # FIX 1
-        subject      = ann.get("subject", ann.get("desc", ""))
+        company      = extract_company_name(ann)
         desc         = ann.get("attchmntText", ann.get("body", ""))
-        nse_date     = ann.get("sort_date", ann.get("an_dt", ""))
         nse_file_url = ann.get("attchmntFile", "")
         sc_url       = screener_link(symbol)
 
         category        = categorise(subject, desc)
-        first_disc_flag = is_first_disclosure(subject, desc, category)   # FIX 2
+        first_disc_flag = is_first_disclosure(subject, desc, category)
 
         cfg     = CATEGORIES.get(category, {"sheet_tab": "Others", "channel": CHANNEL_OTHERS})
         tab     = cfg["sheet_tab"] if isinstance(cfg, dict) else "Others"
@@ -401,7 +384,6 @@ def run():
 
         logged_at = now_ist.strftime("%d-%m-%Y %H:%M")
 
-        # ── Build row ─────────────────────────────────────────────────────
         if category == "Investors Meet":
             investor_name = extract_investor_name(subject, desc)
             row = [
@@ -421,13 +403,15 @@ def run():
         msg = format_telegram_message(ann, category, company, first_disc_flag)
         send_telegram(channel, msg)
 
-        seen_ids.add(unique_key)
+        # Mark both keys as seen
+        seen_ids.add(primary_key)
+        seen_ids.add(content_key)
         new_count += 1
         log.info(f"[{category}] {company} ({symbol}) — {subject[:70]}")
         time.sleep(0.4)
 
     save_seen_ids(seen_ids)
-    log.info(f"=== Run complete. {new_count} new announcements processed ===")
+    log.info(f"=== Run complete. New: {new_count} | Skipped (already seen): {skip_count} ===")
 
 if __name__ == "__main__":
     run()
